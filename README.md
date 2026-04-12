@@ -152,3 +152,165 @@ fraud_score =
 | `STDDEV` / `MEDIAN` | Statistical aggregates for behavioral profiling |
 | CTEs (`WITH ... AS`) | Modular, readable multi-step query pipeline |
 | `UNION ALL` | Row-count verification across all tables |
+
+---
+
+## Deep Dive: Key Concepts
+
+### 1. Building Baselines with Aggregates
+
+A **baseline** is a statistical snapshot of a user's normal behavior computed from historical data. In fraud detection, it answers: *"what does this user's typical activity look like?"* — so that today's transactions can be compared against it.
+
+The `baseline` CTE uses standard SQL aggregates over each user's past transactions:
+
+| Aggregate | What it captures |
+|---|---|
+| `AVG(amount)` | Typical spend level |
+| `STDDEV(amount)` | How much the spend naturally varies |
+| `MAX(amount)` | The ceiling of normal behavior |
+| `COUNT(DISTINCT merchant_id)` | Breadth of normal merchant activity |
+| `COUNT(DISTINCT country)` | Geographic footprint |
+| `SUM(CASE WHEN status = 'FLAGGED' ...)` | Prior fraud signals embedded in history |
+
+**Why STDDEV matters:** A user who regularly spends $5,000–$10,000 should not be flagged for a $6,000 transaction. STDDEV captures variability so the z-score formula can normalise the amount relative to *that user's own range*, not a global threshold.
+
+**Design note:** The baseline window (`txn_ts < CURRENT_DATE()`) is deliberately exclusive of today. This prevents today's potentially fraudulent transactions from polluting the reference distribution used to score them.
+
+```sql
+-- Safe pattern: historical only
+WHERE t.txn_ts < CURRENT_DATE()
+
+-- Avoid: mixing today's events into the baseline
+-- WHERE t.txn_ts >= DATEADD('day', -30, CURRENT_TIMESTAMP())  -- includes today
+```
+
+---
+
+### 2. Combining Multiple Weak Signals into a Triage Cut
+
+No single signal reliably separates fraud from legitimate activity. A large transaction amount could be a legitimate purchase. A foreign country flag could be a traveller. Each signal alone has high false-positive rates. The solution is to **combine weak signals into a composite score** and apply thresholds to create a triage cut.
+
+This query uses a **weighted additive model**:
+
+```
+fraud_score =
+    amount_anomaly_score   (0–40)   ← statistical signal
+  + user_risk_score        (0–30)   ← profile-level prior
+  + foreign_country_flag   (0–15)   ← geo signal
+  + exceeds_hist_max       (0–15)   ← absolute ceiling signal
+```
+
+**Why this works:**
+- A user with a low risk score transacting abroad for an unusual amount scores across multiple dimensions simultaneously, compounding the signal.
+- A high-risk user (`risk_score = 80`) making a normal domestic transaction scores only `0.8 × 30 = 24` — below both thresholds.
+- A low-risk user (`risk_score = 10`) making a 5-sigma foreign transaction that exceeds their historical max scores `40 + 3 + 15 + 15 = 73` — triggering BLOCK.
+
+**Triage cut thresholds:**
+
+| Score | Action | Rationale |
+|---|---|---|
+| ≥ 70 | **BLOCK** | Multiple strong signals align — high confidence fraud |
+| 45–69 | **REVIEW** | Ambiguous — route to a human analyst |
+| < 45 | **PASS** | Low risk — approve automatically |
+
+The thresholds are tunable. Lowering the REVIEW threshold increases catch rate but increases analyst workload. This is the core precision/recall trade-off in fraud triage.
+
+---
+
+### 3. QUALIFY for Post-Window Filtering
+
+`QUALIFY` is a Snowflake clause that filters rows **after** a window function is evaluated — analogous to how `HAVING` filters after `GROUP BY`. Without it, you need a subquery or CTE to filter on a window result.
+
+**Without QUALIFY (verbose):**
+```sql
+SELECT * FROM (
+    SELECT
+        txn_id,
+        user_id,
+        amount,
+        ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY txn_ts DESC) AS rn
+    FROM TRANSACTIONS
+)
+WHERE rn = 1;
+```
+
+**With QUALIFY (clean):**
+```sql
+SELECT txn_id, user_id, amount
+FROM TRANSACTIONS
+QUALIFY ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY txn_ts DESC) = 1;
+```
+
+**Where it applies to this project:** If you extend the scoring query to look at the user's *most recent* prior transaction, or flag users whose last N transactions were all flagged, `QUALIFY` lets you filter on those window results inline without wrapping the scored CTE in another subquery.
+
+**Common patterns:**
+```sql
+-- Latest transaction per user
+QUALIFY ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY txn_ts DESC) = 1
+
+-- Only users whose current transaction exceeds their rolling 7-day max
+QUALIFY amount > MAX(amount) OVER (
+    PARTITION BY user_id
+    ORDER BY txn_ts
+    ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING
+)
+
+-- Top 3 highest-value transactions per user
+QUALIFY RANK() OVER (PARTITION BY user_id ORDER BY amount DESC) <= 3
+```
+
+> `QUALIFY` is evaluated after `WHERE`, `GROUP BY`, and `HAVING` but before `ORDER BY` and `LIMIT` — it sits at the very end of the logical query processing order.
+
+---
+
+### 4. Where to Compute Features: CTEs vs Views vs Materialized Views
+
+Feature computation is the costliest part of a scoring pipeline. Where you place the logic determines freshness, performance, and maintainability.
+
+| | CTE | View | Materialized View |
+|---|---|---|---|
+| **Storage** | None (inline) | None (stored query) | Yes (stored result) |
+| **Freshness** | Always current | Always current | Lags until refresh |
+| **Reuse** | This query only | Any query | Any query |
+| **Compute cost** | Every execution | Every execution | Paid at refresh time |
+| **Best for** | One-off / dev / ad hoc | Shared logic, always-fresh | High-frequency reads on slow-changing data |
+
+#### CTEs — used in this file
+```sql
+WITH baseline AS (...),
+     today_txns AS (...),
+     scored AS (...)
+SELECT * FROM scored;
+```
+Best for exploratory work and keeping a multi-step pipeline readable in a single script. The `baseline` and `scored` logic runs fresh every time the query executes. No persistence.
+
+#### Views — next step for shared use
+```sql
+CREATE OR REPLACE VIEW SUPPORT.USER_BASELINE AS
+SELECT user_id, AVG(amount) AS avg_amount, STDDEV(amount) AS stddev_amount, ...
+FROM TRANSACTIONS
+WHERE txn_ts < CURRENT_DATE()
+GROUP BY user_id;
+```
+Any downstream query can join against `USER_BASELINE` without duplicating the aggregation logic. Always reflects the latest data. The trade-off: every consumer re-executes the aggregation from scratch.
+
+#### Materialized Views — for production scoring
+```sql
+CREATE OR REPLACE MATERIALIZED VIEW SUPPORT.USER_BASELINE_MV AS
+SELECT user_id, AVG(amount) AS avg_amount, STDDEV(amount) AS stddev_amount, ...
+FROM TRANSACTIONS
+WHERE txn_ts < CURRENT_DATE()
+GROUP BY user_id;
+```
+Snowflake pre-computes and stores the result. Reads are instant — the real-time scoring join against the baseline becomes a fast key lookup rather than a full aggregation. Snowflake automatically refreshes the MV when the underlying `TRANSACTIONS` table changes (within the constraints of the MV definition).
+
+**Recommended progression for this project:**
+
+```
+Development  →  CTEs (this file)
+Shared logic →  View (USER_BASELINE)
+Production   →  Materialized View (USER_BASELINE_MV)
+Real-time    →  Dynamic Tables (Snowflake-native streaming alternative to MVs)
+```
+
+> **Dynamic Tables** are Snowflake's modern replacement for complex MV pipelines. They let you define a target lag (e.g., `TARGET_LAG = '1 minute'`) and Snowflake incrementally refreshes the result — ideal for a near-real-time fraud baseline that needs to reflect transactions from the last hour.
