@@ -280,3 +280,148 @@ SELECT
 FROM scored
 ORDER BY fraud_score DESC;
 
+-- ============================================================
+-- DISPUTE BREAKDOWN ANALYSIS
+-- ============================================================
+
+-- 1. Disputes by Merchant (top contributors by count & total amount)
+SELECT
+    t.merchant_id,
+    COUNT(*)                          AS dispute_count,
+    SUM(t.amount)                     AS total_disputed_amount,
+    AVG(t.amount)                     AS avg_disputed_amount,
+    LISTAGG(DISTINCT d.dispute_reason, ', ')
+        WITHIN GROUP (ORDER BY d.dispute_reason) AS reasons_seen,
+    LISTAGG(DISTINCT d.outcome, ', ')
+        WITHIN GROUP (ORDER BY d.outcome)        AS outcomes
+FROM TD_CORTEX_LABS_PURAV.SUPPORT.DISPUTES d
+JOIN TD_CORTEX_LABS_PURAV.SUPPORT.TRANSACTIONS t ON t.txn_id = d.txn_id
+GROUP BY t.merchant_id
+ORDER BY dispute_count DESC, total_disputed_amount DESC;
+
+-- 2. Disputes by Dispute Reason
+SELECT
+    d.dispute_reason,
+    COUNT(*)                          AS dispute_count,
+    SUM(t.amount)                     AS total_disputed_amount,
+    AVG(t.amount)                     AS avg_disputed_amount,
+    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS pct_of_total
+FROM TD_CORTEX_LABS_PURAV.SUPPORT.DISPUTES d
+JOIN TD_CORTEX_LABS_PURAV.SUPPORT.TRANSACTIONS t ON t.txn_id = d.txn_id
+GROUP BY d.dispute_reason
+ORDER BY dispute_count DESC;
+
+-- 3. Disputes by Channel
+SELECT
+    t.channel,
+    COUNT(*)                          AS dispute_count,
+    SUM(t.amount)                     AS total_disputed_amount,
+    AVG(t.amount)                     AS avg_disputed_amount,
+    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS pct_of_total
+FROM TD_CORTEX_LABS_PURAV.SUPPORT.DISPUTES d
+JOIN TD_CORTEX_LABS_PURAV.SUPPORT.TRANSACTIONS t ON t.txn_id = d.txn_id
+GROUP BY t.channel
+ORDER BY dispute_count DESC;
+
+-- 4. Disputes by Country
+SELECT
+    t.country,
+    COUNT(*)                          AS dispute_count,
+    SUM(t.amount)                     AS total_disputed_amount,
+    AVG(t.amount)                     AS avg_disputed_amount,
+    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS pct_of_total
+FROM TD_CORTEX_LABS_PURAV.SUPPORT.DISPUTES d
+JOIN TD_CORTEX_LABS_PURAV.SUPPORT.TRANSACTIONS t ON t.txn_id = d.txn_id
+GROUP BY t.country
+ORDER BY dispute_count DESC;
+
+-- 5. Top Contributors: Merchant x Reason x Channel x Country
+SELECT
+    t.merchant_id,
+    d.dispute_reason,
+    t.channel,
+    t.country,
+    COUNT(*)                          AS dispute_count,
+    SUM(t.amount)                     AS total_disputed_amount
+FROM TD_CORTEX_LABS_PURAV.SUPPORT.DISPUTES d
+JOIN TD_CORTEX_LABS_PURAV.SUPPORT.TRANSACTIONS t ON t.txn_id = d.txn_id
+GROUP BY t.merchant_id, d.dispute_reason, t.channel, t.country
+ORDER BY dispute_count DESC, total_disputed_amount DESC
+LIMIT 20;
+
+-- 6. Week-over-Week Dispute Changes (overall)
+WITH weekly AS (
+    SELECT
+        DATE_TRUNC('week', d.dispute_ts)::DATE AS week_start,
+        COUNT(*)                                AS dispute_count,
+        SUM(t.amount)                           AS total_disputed_amount
+    FROM TD_CORTEX_LABS_PURAV.SUPPORT.DISPUTES d
+    JOIN TD_CORTEX_LABS_PURAV.SUPPORT.TRANSACTIONS t ON t.txn_id = d.txn_id
+    GROUP BY week_start
+)
+SELECT
+    w.week_start,
+    w.dispute_count,
+    w.total_disputed_amount,
+    LAG(w.dispute_count) OVER (ORDER BY w.week_start)            AS prev_week_count,
+    LAG(w.total_disputed_amount) OVER (ORDER BY w.week_start)    AS prev_week_amount,
+    w.dispute_count - COALESCE(LAG(w.dispute_count) OVER (ORDER BY w.week_start), 0)
+        AS wow_count_change,
+    ROUND(
+        (w.dispute_count - LAG(w.dispute_count) OVER (ORDER BY w.week_start))
+        * 100.0 / NULLIF(LAG(w.dispute_count) OVER (ORDER BY w.week_start), 0)
+    , 2) AS wow_count_change_pct,
+    ROUND(
+        (w.total_disputed_amount - LAG(w.total_disputed_amount) OVER (ORDER BY w.week_start))
+        * 100.0 / NULLIF(LAG(w.total_disputed_amount) OVER (ORDER BY w.week_start), 0)
+    , 2) AS wow_amount_change_pct
+FROM weekly w
+ORDER BY w.week_start;
+
+-- 7. Week-over-Week by Dispute Reason
+WITH weekly_reason AS (
+    SELECT
+        DATE_TRUNC('week', d.dispute_ts)::DATE AS week_start,
+        d.dispute_reason,
+        COUNT(*)                                AS dispute_count,
+        SUM(t.amount)                           AS total_disputed_amount
+    FROM TD_CORTEX_LABS_PURAV.SUPPORT.DISPUTES d
+    JOIN TD_CORTEX_LABS_PURAV.SUPPORT.TRANSACTIONS t ON t.txn_id = d.txn_id
+    GROUP BY week_start, d.dispute_reason
+)
+SELECT
+    wr.week_start,
+    wr.dispute_reason,
+    wr.dispute_count,
+    wr.total_disputed_amount,
+    wr.dispute_count - COALESCE(
+        LAG(wr.dispute_count) OVER (PARTITION BY wr.dispute_reason ORDER BY wr.week_start), 0
+    ) AS wow_count_change,
+    ROUND(
+        (wr.total_disputed_amount - LAG(wr.total_disputed_amount) OVER (PARTITION BY wr.dispute_reason ORDER BY wr.week_start))
+        * 100.0 / NULLIF(LAG(wr.total_disputed_amount) OVER (PARTITION BY wr.dispute_reason ORDER BY wr.week_start), 0)
+    , 2) AS wow_amount_change_pct
+FROM weekly_reason wr
+ORDER BY wr.week_start, wr.dispute_count DESC;
+
+-- 8. Week-over-Week by Country
+WITH weekly_country AS (
+    SELECT
+        DATE_TRUNC('week', d.dispute_ts)::DATE AS week_start,
+        t.country,
+        COUNT(*)                                AS dispute_count,
+        SUM(t.amount)                           AS total_disputed_amount
+    FROM TD_CORTEX_LABS_PURAV.SUPPORT.DISPUTES d
+    JOIN TD_CORTEX_LABS_PURAV.SUPPORT.TRANSACTIONS t ON t.txn_id = d.txn_id
+    GROUP BY week_start, t.country
+)
+SELECT
+    wc.week_start,
+    wc.country,
+    wc.dispute_count,
+    wc.total_disputed_amount,
+    wc.dispute_count - COALESCE(
+        LAG(wc.dispute_count) OVER (PARTITION BY wc.country ORDER BY wc.week_start), 0
+    ) AS wow_count_change
+FROM weekly_country wc
+ORDER BY wc.week_start, wc.dispute_count DESC;
