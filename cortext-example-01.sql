@@ -425,3 +425,168 @@ SELECT
     ) AS wow_count_change
 FROM weekly_country wc
 ORDER BY wc.week_start, wc.dispute_count DESC;
+
+
+---- =====
+-- 4/14/2026
+---- =====
+
+CREATE TABLE IF NOT EXISTS TD_CORTEX_LABS_PURAV.SUPPORT.SESSION_TELEMETRY (
+    session_id   VARCHAR NOT NULL PRIMARY KEY,
+    txn_id       VARCHAR,
+    captured_at  TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    raw_payload  VARIANT,
+    FOREIGN KEY (txn_id) REFERENCES TD_CORTEX_LABS_PURAV.SUPPORT.TRANSACTIONS(txn_id)
+)
+
+
+INSERT INTO TD_CORTEX_LABS_PURAV.SUPPORT.SESSION_TELEMETRY (session_id, txn_id, captured_at, raw_payload)
+SELECT column1, column2, column3, PARSE_JSON(column4)
+FROM VALUES
+  ('S026', 'TXN026', CURRENT_TIMESTAMP(),
+   '{"device":{"fingerprint":"fp_aabb01","type":"Android","os_version":"14.0","is_emulator":false},"network":{"ip":"41.80.12.55","ip_risk_score":"87","vpn_detected":true,"geo_country":"KE"},"velocity":{"txn_count_1h":"5","txn_count_24h":"11","distinct_merchants_1h":"4"},"signals":["NEW_DEVICE","GEO_MISMATCH","HIGH_VELOCITY"]}'),
+
+  ('S027', 'TXN027', CURRENT_TIMESTAMP(),
+   '{"device":{"fingerprint":"fp_cc2200","type":"iPhone","os_version":"17.4","is_emulator":false},"network":{"ip":"223.104.3.88","ip_risk_score":"92","vpn_detected":true,"geo_country":"CN"},"velocity":{"txn_count_1h":"3","txn_count_24h":"8","distinct_merchants_1h":"3"},"signals":["GEO_MISMATCH","VPN_ACTIVE","HIGH_AMOUNT"]}'),
+
+  ('S028', 'TXN028', CURRENT_TIMESTAMP(),
+   '{"device":{"fingerprint":"fp_dd3300","type":"Android","os_version":"13.0","is_emulator":true},"network":{"ip":"185.220.101.5","ip_risk_score":"99","vpn_detected":true,"geo_country":"RU"},"velocity":{"txn_count_1h":"8","txn_count_24h":"22","distinct_merchants_1h":"7"},"signals":["EMULATOR","TOR_EXIT","GEO_MISMATCH","HIGH_VELOCITY","HIGH_AMOUNT"]}'),
+
+  ('S029', 'TXN029', CURRENT_TIMESTAMP(),
+   '{"device":{"fingerprint":"fp_ee4400","type":"Android","os_version":"12.0","is_emulator":false},"network":{"ip":"94.214.55.12","ip_risk_score":"74","vpn_detected":false,"geo_country":"AE"},"velocity":{"txn_count_1h":"2","txn_count_24h":"6","distinct_merchants_1h":"2"},"signals":["GEO_MISMATCH","NEW_DEVICE"]}'),
+
+  ('S030', 'TXN030', CURRENT_TIMESTAMP(),
+   '{"device":{"fingerprint":"fp_ff5500","type":"Android","os_version":"14.0","is_emulator":false},"network":{"ip":"105.112.78.33","ip_risk_score":"81","vpn_detected":false,"geo_country":"NG"},"velocity":{"txn_count_1h":"6","txn_count_24h":"15","distinct_merchants_1h":"5"},"signals":["HIGH_VELOCITY","GEO_MISMATCH","RAPID_SUCCESSION"]}'),
+
+  ('S031', 'TXN031', CURRENT_TIMESTAMP(),
+   '{"device":{"fingerprint":"fp_aabb99","type":"iPhone","os_version":"17.4","is_emulator":false},"network":{"ip":"82.132.248.10","ip_risk_score":"12","vpn_detected":false,"geo_country":"GB"},"velocity":{"txn_count_1h":"1","txn_count_24h":"2","distinct_merchants_1h":"1"},"signals":[]}'),
+
+  ('S032', 'TXN032', CURRENT_TIMESTAMP(),
+   '{"device":{"fingerprint":"fp_bb1122","type":"iPhone","os_version":"16.6","is_emulator":false},"network":{"ip":"73.162.44.200","ip_risk_score":"8","vpn_detected":false,"geo_country":"US"},"velocity":{"txn_count_1h":"1","txn_count_24h":"1","distinct_merchants_1h":"1"},"signals":[]}'),
+
+  ('S033', 'TXN033', CURRENT_TIMESTAMP(),
+   '{"device":{"fingerprint":"fp_cc3344","type":"Windows","os_version":"11","is_emulator":false},"network":{"ip":"217.110.33.90","ip_risk_score":"15","vpn_detected":false,"geo_country":"DE"},"velocity":{"txn_count_1h":"1","txn_count_24h":"3","distinct_merchants_1h":"2"},"signals":[]}');
+
+-- ============================================================
+-- TELEMETRY ENRICHMENT: Parse JSON + FLATTEN + TRY_TO_* + Join
+-- ============================================================
+
+-- STEP 1: Schema-on-read — extract nested VARIANT fields with safe casting
+
+WITH telemetry_parsed AS (
+    SELECT
+        st.session_id,
+        st.txn_id,
+        st.captured_at,
+        st.raw_payload:device:fingerprint::VARCHAR            AS device_fingerprint,
+        st.raw_payload:device:type::VARCHAR                   AS device_type,
+        st.raw_payload:device:os_version::VARCHAR             AS device_os_version,
+        st.raw_payload:device:is_emulator::BOOLEAN            AS is_emulator,
+        st.raw_payload:network:ip::VARCHAR                    AS ip_address,
+        TRY_TO_NUMBER(
+            st.raw_payload:network:ip_risk_score::VARCHAR
+        )                                                     AS ip_risk_score,
+        st.raw_payload:network:vpn_detected::BOOLEAN          AS vpn_detected,
+        st.raw_payload:network:geo_country::VARCHAR           AS geo_country,
+        TRY_TO_NUMBER(
+            st.raw_payload:velocity:txn_count_1h::VARCHAR
+        )                                                     AS velocity_txn_1h,
+        TRY_TO_NUMBER(
+            st.raw_payload:velocity:txn_count_24h::VARCHAR
+        )                                                     AS velocity_txn_24h,
+        TRY_TO_NUMBER(
+            st.raw_payload:velocity:distinct_merchants_1h::VARCHAR
+        )                                                     AS velocity_merchants_1h,
+        st.raw_payload:signals                                AS signals_array
+    FROM TD_CORTEX_LABS_PURAV.SUPPORT.SESSION_TELEMETRY st
+),
+telemetry_signals AS (
+    SELECT
+        tp.session_id,
+        tp.txn_id,
+        f.value::VARCHAR AS signal_name
+    FROM telemetry_parsed tp,
+         LATERAL FLATTEN(input => tp.signals_array, OUTER => TRUE) f
+),
+telemetry_with_signals AS (
+    SELECT
+        tp.*,
+        COALESCE(
+            LISTAGG(DISTINCT ts.signal_name, ', ')
+                WITHIN GROUP (ORDER BY ts.signal_name),
+            '(none)'
+        )                                                     AS signal_list,
+        COUNT(ts.signal_name)                                 AS signal_count
+    FROM telemetry_parsed tp
+    LEFT JOIN telemetry_signals ts
+        ON ts.session_id = tp.session_id
+    GROUP BY
+        tp.session_id, tp.txn_id, tp.captured_at,
+        tp.device_fingerprint, tp.device_type, tp.device_os_version, tp.is_emulator,
+        tp.ip_address, tp.ip_risk_score, tp.vpn_detected, tp.geo_country,
+        tp.velocity_txn_1h, tp.velocity_txn_24h, tp.velocity_merchants_1h,
+        tp.signals_array
+),
+today_suspicious AS (
+    SELECT *
+    FROM TD_CORTEX_LABS_PURAV.SUPPORT.TRANSACTIONS
+    WHERE status IN ('FLAGGED', 'DECLINED')
+)
+SELECT
+    ts_txn.txn_id,
+    ts_txn.user_id,
+    ts_txn.amount,
+    ts_txn.currency,
+    ts_txn.channel,
+    ts_txn.country           AS txn_country,
+    ts_txn.status,
+    tel.session_id,
+    tel.device_fingerprint,
+    tel.device_type,
+    tel.is_emulator,
+    tel.ip_address,
+    tel.ip_risk_score,
+    tel.vpn_detected,
+    tel.geo_country          AS device_geo_country,
+    tel.velocity_txn_1h,
+    tel.velocity_txn_24h,
+    tel.signal_list,
+    tel.signal_count,
+    u.home_country,
+    u.risk_score             AS user_risk_score,
+    CASE WHEN tel.geo_country != u.home_country THEN TRUE ELSE FALSE
+    END                      AS geo_mismatch_flag,
+    ROUND(
+        (LEAST(COALESCE(tel.ip_risk_score, 0), 100) / 100.0) * 30
+      + (CASE WHEN tel.is_emulator THEN 1 ELSE 0 END)         * 15
+      + (CASE WHEN tel.vpn_detected THEN 1 ELSE 0 END)        * 10
+      + (LEAST(COALESCE(tel.velocity_txn_1h, 0), 10) / 10.0)  * 15
+      + (CASE WHEN tel.geo_country != u.home_country
+              THEN 1 ELSE 0 END)                               * 15
+      + (u.risk_score / 100.0)                                 * 15
+    , 2)                     AS telemetry_risk_score,
+    CASE
+        WHEN (LEAST(COALESCE(tel.ip_risk_score, 0), 100) / 100.0) * 30
+           + (CASE WHEN tel.is_emulator THEN 1 ELSE 0 END)         * 15
+           + (CASE WHEN tel.vpn_detected THEN 1 ELSE 0 END)        * 10
+           + (LEAST(COALESCE(tel.velocity_txn_1h, 0), 10) / 10.0)  * 15
+           + (CASE WHEN tel.geo_country != u.home_country
+                   THEN 1 ELSE 0 END)                               * 15
+           + (u.risk_score / 100.0)                                 * 15
+             >= 65 THEN 'BLOCK'
+        WHEN (LEAST(COALESCE(tel.ip_risk_score, 0), 100) / 100.0) * 30
+           + (CASE WHEN tel.is_emulator THEN 1 ELSE 0 END)         * 15
+           + (CASE WHEN tel.vpn_detected THEN 1 ELSE 0 END)        * 10
+           + (LEAST(COALESCE(tel.velocity_txn_1h, 0), 10) / 10.0)  * 15
+           + (CASE WHEN tel.geo_country != u.home_country
+                   THEN 1 ELSE 0 END)                               * 15
+           + (u.risk_score / 100.0)                                 * 15
+             >= 40 THEN 'REVIEW'
+        ELSE 'PASS'
+    END                      AS recommended_action
+FROM today_suspicious ts_txn
+JOIN TD_CORTEX_LABS_PURAV.SUPPORT.USERS u
+    ON u.user_id = ts_txn.user_id
+LEFT JOIN telemetry_with_signals tel
+    ON tel.txn_id = ts_txn.txn_id
+ORDER BY telemetry_risk_score DESC;
