@@ -55,7 +55,9 @@ Free-text support agent notes linked to transactions, capturing investigation de
 
 ---
 
-## Query 1 — Per-User Behavioral Baseline
+## Queries
+
+### Query 1 — Per-User Behavioral Baseline
 
 ```sql
 -- build a per user baseline for last 30 days
@@ -79,7 +81,7 @@ Aggregates each user's transaction history to establish a behavioral fingerprint
 
 ---
 
-## Query 2 — Real-Time Fraud Scoring (CTE Pipeline)
+### Query 2 — Real-Time Fraud Scoring (CTE Pipeline)
 
 The main query uses three CTEs chained together:
 
@@ -139,6 +141,64 @@ fraud_score =
 
 ---
 
+### Query 3 — Dispute Breakdown Analysis
+
+Eight analytical queries covering how disputes are distributed and how they trend over time.
+
+#### Breakdowns (Queries 1–5)
+
+| Query | Dimension | Key Metrics |
+|---|---|---|
+| 1 | Merchant | dispute count, total & avg amount, reasons seen, outcomes |
+| 2 | Dispute reason | count, amount, `pct_of_total` using `SUM(...) OVER ()` |
+| 3 | Channel | count, amount, `pct_of_total` |
+| 4 | Country | count, amount, `pct_of_total` |
+| 5 | Merchant × Reason × Channel × Country | multi-dimension cross-tab, top 20 |
+
+**`pct_of_total` pattern** — used in queries 2–4:
+```sql
+ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS pct_of_total
+```
+`SUM(COUNT(*)) OVER ()` is a window function with no `PARTITION BY`, so it sums across the entire result set. Dividing the group count by that gives each row's share of total disputes without a self-join or subquery.
+
+**`LISTAGG`** — used in query 1:
+```sql
+LISTAGG(DISTINCT d.dispute_reason, ', ')
+    WITHIN GROUP (ORDER BY d.dispute_reason) AS reasons_seen
+```
+Aggregates multiple reason values for the same merchant into a single comma-separated string. `DISTINCT` deduplications within the list.
+
+#### Week-over-Week Trends (Queries 6–8)
+
+| Query | Dimension | Window |
+|---|---|---|
+| 6 | Overall | `LAG` over week |
+| 7 | By dispute reason | `LAG PARTITION BY dispute_reason` |
+| 8 | By country | `LAG PARTITION BY country` |
+
+**Pattern — `DATE_TRUNC` + `LAG`:**
+```sql
+WITH weekly AS (
+    SELECT DATE_TRUNC('week', dispute_ts)::DATE AS week_start,
+           COUNT(*) AS dispute_count, ...
+    FROM DISPUTES JOIN TRANSACTIONS ...
+    GROUP BY week_start
+)
+SELECT
+    week_start,
+    dispute_count,
+    LAG(dispute_count) OVER (ORDER BY week_start) AS prev_week_count,
+    dispute_count - COALESCE(LAG(dispute_count) OVER (ORDER BY week_start), 0) AS wow_change
+FROM weekly;
+```
+
+- `DATE_TRUNC('week', ...)` floors each timestamp to the Monday of its week, enabling clean weekly bucketing.
+- `LAG(...) OVER (ORDER BY week_start)` fetches the previous week's value for the same row.
+- `COALESCE(..., 0)` handles the first week where there is no prior row.
+- Queries 7 & 8 add `PARTITION BY` so the lag resets per dimension (reason or country), preventing cross-dimension comparisons.
+
+---
+
 ## Key Snowflake / SQL Concepts Used
 
 | Concept | Where |
@@ -152,6 +212,11 @@ fraud_score =
 | `STDDEV` / `MEDIAN` | Statistical aggregates for behavioral profiling |
 | CTEs (`WITH ... AS`) | Modular, readable multi-step query pipeline |
 | `UNION ALL` | Row-count verification across all tables |
+| `LISTAGG(DISTINCT ...)` | Concatenate dispute reasons/outcomes per merchant |
+| `SUM(COUNT(*)) OVER ()` | Compute group share of total without a self-join |
+| `DATE_TRUNC('week', ...)` | Bucket timestamps into weekly periods |
+| `LAG` with `PARTITION BY` | Week-over-week change per dimension |
+| `COALESCE` with `LAG` | Handle first-week null in WoW calculations |
 
 ---
 
